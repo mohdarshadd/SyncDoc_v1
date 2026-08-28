@@ -12,10 +12,7 @@ export function mapToBlock(m) {
 }
 
 export function snapshotFromYArray(arr) {
-  return arr
-    .toArray()
-    .map(mapToBlock)
-    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+  return arr.toArray().map(mapToBlock)
 }
 
 export function diffBlocks(prev, full) {
@@ -56,8 +53,10 @@ export function mergeDelta(snapshot, delta) {
     if (i != null) {
       next[i] = { ...next[i], ...incoming }
     } else {
-      next.push({ ...incoming })
-      index.set(incoming.id, next.length - 1)
+      const at = Math.min(incoming.order ?? next.length, next.length)
+      next.splice(at, 0, { ...incoming })
+      index.set(incoming.id, at)
+      for (let k = at; k < next.length; k++) index.set(next[k].id, k)
     }
   }
 
