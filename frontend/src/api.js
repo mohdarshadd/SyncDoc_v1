@@ -69,9 +69,26 @@ export const deleteDocument = (id) => request(`/documents/${id}`, { method: 'DEL
 
 export const renameDocument = (id, title) => request(`/documents/${id}/rename`, { method: 'PATCH', body: JSON.stringify({ title }) })
 
+export const saveDocumentContent = (id, body) => request(`/documents/${id}/content`, { method: 'PATCH', body: JSON.stringify(body) })
+
 export const importMarkdown = (body) => request('/import/markdown', { method: 'POST', body: JSON.stringify(body) })
 
-export const exportUrl = (id, format) => `/api/documents/${id}/export/${format}`
+export async function exportDocument(id, format) {
+  const headers = {}
+  if (accessToken) headers['Authorization'] = `Bearer ${accessToken}`
+  let res = await fetch(`${API_BASE}/documents/${id}/export/${format}`, { headers })
+  if (res.status === 401) {
+    const refreshed = await refreshAccessToken()
+    if (!refreshed) throw new Error('Session expired')
+    headers['Authorization'] = `Bearer ${accessToken}`
+    res = await fetch(`${API_BASE}/documents/${id}/export/${format}`, { headers })
+  }
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.error || `Request failed: ${res.status}`)
+  }
+  return res.blob()
+}
 
 export const listShares = (docId) => request(`/documents/${docId}/shares`)
 
@@ -97,6 +114,7 @@ export const restoreVersion = (docId, revision) => request(`/documents/${docId}/
 
 export const WS_URL = import.meta.env.VITE_WS_URL || (() => {
   if (typeof window === 'undefined') return 'ws://localhost:4000/ws'
+  if (import.meta.env.DEV) return 'ws://localhost:4000/ws'
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   return `${proto}//${window.location.host}/ws`
 })()

@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import * as Y from 'yjs'
 import { WebsocketProvider } from 'y-websocket'
-import { getDocument, getAccessToken, WS_URL, renameDocument } from '../api'
+import { getDocument, getAccessToken, WS_URL, renameDocument, saveDocumentContent } from '../api'
 import { buildYdoc } from '../lib/ydoc'
 import { diffBlocks, mergeDelta, snapshotFromYArray, commentsFromYArray } from '../store/blockStore'
 import { uid } from '../lib/uid'
 import { toggleMark, clearMarks as emptyMarks } from '../lib/richText'
 import { buildComment } from '../lib/comments'
+import { pushToast } from '../lib/toast'
 
 const COLORS = ['#e11d48', '#2563eb', '#16a34a', '#9333ea', '#ea580c', '#0891b2', '#65a30d', '#db2777']
 
@@ -20,6 +21,10 @@ export function useDocumentSync(docId, user) {
   const ydocRef = useRef(null)
   const providerRef = useRef(null)
   const renameTimerRef = useRef(null)
+  const typingTimerRef = useRef(null)
+  const prevStatusRef = useRef(null)
+  const fallbackSaveTimerRef = useRef(null)
+  const wsConnectedRef = useRef(false)
   const [status, setStatus] = useState('connecting')
   const [title, setTitle] = useState('')
   const [blocks, setBlocks] = useState([])
@@ -27,11 +32,39 @@ export function useDocumentSync(docId, user) {
   const [users, setUsers] = useState([])
   const [myClientId, setMyClientId] = useState(null)
   const [docRole, setDocRole] = useState(null)
+  const [savedAt, setSavedAt] = useState(Date.now())
 
   useEffect(() => {
     let cancelled = false
     let provider = null
     let ydoc = null
+
+    const buildFallbackPayload = (target) => {
+      if (!target || wsConnectedRef.current) return null
+      const blocks = snapshotFromYArray(target.getArray('blocks')).map((b) => ({
+        id: b.id,
+        type: b.type,
+        text: b.text || '',
+        lang: b.lang || null,
+        checked: !!b.checked,
+        open: b.open !== false,
+        collapsed: !!b.collapsed,
+        attrs: { marks: Array.isArray(b.marks) ? b.marks : [] },
+        parentId: b.parentId || null,
+        order: b.order
+      }))
+      return {
+        title: String(target.getMap('meta').get('title') ?? 'Untitled'),
+        blocks,
+        comments: commentsFromYArray(target.getArray('comments'))
+      }
+    }
+
+    const onVisibility = () => {
+      const hidden = document.visibilityState === 'hidden'
+      if (provider) provider.awareness.setLocalStateField('typing', false)
+      if (provider) provider.awareness.setLocalStateField('hidden', hidden)
+    }
 
     async function init() {
       try {
@@ -45,7 +78,18 @@ export function useDocumentSync(docId, user) {
           params: { token: getAccessToken() || '' }
         })
         provider.on('status', ({ status: s }) => {
-          if (!cancelled) setStatus(s)
+          if (!cancelled) {
+            const prev = prevStatusRef.current
+            prevStatusRef.current = s
+            wsConnectedRef.current = s === 'connected'
+            setStatus(s)
+            if (s === 'connected') setSavedAt(Date.now())
+            if (s === 'disconnected' && prev && prev !== 'disconnected') {
+              pushToast('Connection lost — retrying…', 'warn')
+            } else if (s === 'connected' && (prev === 'disconnected' || prev === 'error')) {
+              pushToast('Reconnected — changes synced', 'ok')
+            }
+          }
         })
 
         const color = user?.color || COLORS[Math.floor(Math.random() * COLORS.length)]
@@ -59,20 +103,44 @@ export function useDocumentSync(docId, user) {
             const delta = diffBlocks(prev, full)
             return delta.length ? mergeDelta(prev, delta) : prev
           })
+          setSavedAt(Date.now())
+          scheduleFallbackSave()
         }
-        const applyComments = () => setComments(commentsFromYArray(commentsArr))
+        const applyComments = () => {
+          setComments(commentsFromYArray(commentsArr))
+          setSavedAt(Date.now())
+          scheduleFallbackSave()
+        }
         const applyTitle = () => {
           const metaTitle = ydoc.getMap('meta').get('title')
           setTitle(metaTitle == null ? 'Untitled' : String(metaTitle))
+          setSavedAt(Date.now())
+          scheduleFallbackSave()
         }
         const applyUsers = () => {
           setMyClientId(provider.awareness.clientID)
+          const myId = provider.awareness.clientID
           const states = []
           provider.awareness.getStates().forEach((state, clientId) => {
-            if (state?.user) states.push({ clientId, ...state.user, cursor: state.cursor || null })
+            if (!state?.user) return
+            if (state.hidden === true && clientId !== myId) return
+            states.push({ clientId, ...state.user, cursor: state.cursor || null, typing: state.typing === true })
           })
           setUsers(states)
         }
+
+        const scheduleFallbackSave = () => {
+          if (wsConnectedRef.current) return
+          clearTimeout(fallbackSaveTimerRef.current)
+          fallbackSaveTimerRef.current = setTimeout(() => {
+            if (cancelled) return
+            const payload = buildFallbackPayload(ydoc)
+            if (!payload) return
+            saveDocumentContent(docId, payload).catch(() => { /* retried on next edit */ })
+          }, 1500)
+        }
+
+        document.addEventListener('visibilitychange', onVisibility)
 
         blocksArr.observeDeep(applyBlocks)
         commentsArr.observeDeep(applyComments)
@@ -86,7 +154,6 @@ export function useDocumentSync(docId, user) {
         applyComments()
         applyTitle()
         applyUsers()
-        if (!cancelled) setStatus('connected')
       } catch (e) {
         if (!cancelled) {
           setStatus('error')
@@ -100,6 +167,13 @@ export function useDocumentSync(docId, user) {
     return () => {
       cancelled = true
       clearTimeout(renameTimerRef.current)
+      clearTimeout(typingTimerRef.current)
+      clearTimeout(fallbackSaveTimerRef.current)
+      const finalPayload = buildFallbackPayload(ydoc)
+      if (finalPayload) {
+        saveDocumentContent(docId, finalPayload).catch(() => { /* noop */ })
+      }
+      document.removeEventListener('visibilitychange', onVisibility)
       try {
         provider?.awareness.setLocalState(null)
       } catch (e) { /* noop */ }
@@ -283,6 +357,18 @@ export function useDocumentSync(docId, user) {
     if (providerRef.current) providerRef.current.awareness.setLocalStateField('cursor', cursor)
   }
 
+  function setTyping(typing) {
+    if (providerRef.current) providerRef.current.awareness.setLocalStateField('typing', !!typing)
+  }
+
+  function notifyTyping() {
+    clearTimeout(typingTimerRef.current)
+    if (providerRef.current) providerRef.current.awareness.setLocalStateField('typing', true)
+    typingTimerRef.current = setTimeout(() => {
+      if (providerRef.current) providerRef.current.awareness.setLocalStateField('typing', false)
+    }, 1500)
+  }
+
   function deleteBlock(id) {
     const ydoc = ydocRef.current
     if (!ydoc) return
@@ -346,5 +432,5 @@ export function useDocumentSync(docId, user) {
     arr.toArray().forEach((m, i) => m.set('order', i))
   }
 
-  return { status, title, blocks, comments, users, myClientId, docRole, updateBlockText, addBlock, changeBlockType, toggleBlockChecked, toggleBlockOpen, toggleBlockCollapsed, toggleBlockMark, clearBlockMarks, setCursor, updateTitle, deleteBlock, moveBlock, reorderBlock, addComment, resolveComment, deleteComment }
+  return { status, title, blocks, comments, users, myClientId, docRole, savedAt, updateBlockText, addBlock, changeBlockType, toggleBlockChecked, toggleBlockOpen, toggleBlockCollapsed, toggleBlockMark, clearBlockMarks, setCursor, setTyping, notifyTyping, updateTitle, deleteBlock, moveBlock, reorderBlock, addComment, resolveComment, deleteComment }
 }

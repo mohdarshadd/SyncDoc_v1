@@ -70,7 +70,7 @@ function placeholderFor(type) {
   }
 }
 
-export default function Block({ block, users, myClientId, onTextChange, onCursor, onDelete, onMove, onAddAfter, onAddAfterType, onReorder, onChangeBlockType, onToggleChecked, onToggleOpen, onToggleCollapsed, onToggleBlockMark, onClearBlockMarks, searchQuery, blockMatches, activeMatch, comments = [], me, onAddComment, onResolveComment, onDeleteComment }) {
+export default function Block({ block, users, myClientId, onTextChange, onCursor, onTyping, onNotifyTyping, onDelete, onMove, onAddAfter, onAddAfterType, onReorder, onChangeBlockType, onToggleChecked, onToggleOpen, onToggleCollapsed, onToggleBlockMark, onClearBlockMarks, searchQuery, blockMatches, activeMatch, comments = [], me, onAddComment, onResolveComment, onDeleteComment }) {
   const ref = useRef(null)
   const cls = TYPE_CLASS[block.type] || 'block-paragraph'
   const depth = block.depth || 0
@@ -135,7 +135,8 @@ export default function Block({ block, users, myClientId, onTextChange, onCursor
     }
   }
 
-  const TYPING_TYPES = ['checklist', 'toggle']
+  const TYPING_TYPES = ['checklist', 'toggle', 'list']
+  const skipNextEnterRef = useRef(false)
 
   function addBelow() {
     const nextType = TYPING_TYPES.includes(block.type) && onAddAfterType ? block.type : null
@@ -184,6 +185,10 @@ export default function Block({ block, users, myClientId, onTextChange, onCursor
 
     if (e.key === 'Enter' && !slashState.active) {
       e.preventDefault()
+      if (skipNextEnterRef.current) {
+        skipNextEnterRef.current = false
+        return
+      }
       addBelow()
       return
     }
@@ -227,6 +232,7 @@ export default function Block({ block, users, myClientId, onTextChange, onCursor
 
   function handleInput(e) {
     const value = e.target.value
+    skipNextEnterRef.current = false
     onTextChange(block.id, value)
     autoGrow()
 
@@ -248,6 +254,7 @@ export default function Block({ block, users, myClientId, onTextChange, onCursor
       onTextChange(block.id, '')
     }
     onChangeBlockType(block.id, type)
+    skipNextEnterRef.current = true
     setSlashState({ active: false, query: '' })
     requestAnimationFrame(() => el?.focus())
   }
@@ -396,9 +403,18 @@ export default function Block({ block, users, myClientId, onTextChange, onCursor
       {editingUsers.length > 0 && (
         <div className="block-editors">
           {editingUsers.map((u) => (
-            <span key={u.clientId} className="editing-badge">
+            <span key={u.clientId} className={`editing-badge ${u.typing ? 'typing' : ''}`}>
               <i style={{ background: u.color }} />
-              {u.name} editing
+              {u.name}
+              {u.typing ? (
+                <span className="typing-dots" aria-label="is typing">
+                  <span />
+                  <span />
+                  <span />
+                </span>
+              ) : (
+                'editing'
+              )}
               {block.text && u.cursor?.index != null && (
                 <span
                   className="cursor-pos"
@@ -485,6 +501,9 @@ export default function Block({ block, users, myClientId, onTextChange, onCursor
             </svg>
           </button>
         )}
+        {block.type === 'list' && (
+          <span className="block-bullet" aria-hidden="true">•</span>
+        )}
         {block.type === 'toggle' && (
           <button
             type="button"
@@ -523,12 +542,12 @@ export default function Block({ block, users, myClientId, onTextChange, onCursor
             placeholder={placeholderFor(block.type)}
             spellCheck={false}
             onInput={handleInput}
-            onFocus={onSelection}
+            onFocus={(e) => { onTyping?.(true); onSelection(e) }}
             onClick={onSelection}
             onKeyUp={onSelection}
             onSelect={onSelection}
-            onBlur={() => { onCursor(null); setSelection(null) }}
-            onKeyDown={onKeyDown}
+            onBlur={() => { onTyping?.(false); onCursor(null); setSelection(null) }}
+            onKeyDown={(e) => { onNotifyTyping?.(); onKeyDown(e) }}
           />
         </div>
         {block.type === 'code' && <span className="block-lang">{block.lang || 'text'}</span>}
