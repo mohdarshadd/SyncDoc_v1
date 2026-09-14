@@ -17,6 +17,19 @@ function cloneMap(m) {
   return c
 }
 
+function dedupeBlocks(blocks) {
+  const map = new Map()
+  for (const b of blocks) {
+    if (!b || !b.id) continue
+    const existing = map.get(b.id)
+    if (!existing) { map.set(b.id, b); continue }
+    const existingText = existing.text || ''
+    const newText = b.text || ''
+    map.set(b.id, newText.length >= existingText.length ? b : existing)
+  }
+  return Array.from(map.values())
+}
+
 export function useDocumentSync(docId, user) {
   const ydocRef = useRef(null)
   const providerRef = useRef(null)
@@ -27,6 +40,7 @@ export function useDocumentSync(docId, user) {
   const wsConnectedRef = useRef(false)
   const [status, setStatus] = useState('connecting')
   const [title, setTitle] = useState('')
+  const [wallpaper, setWallpaperState] = useState('none')
   const [blocks, setBlocks] = useState([])
   const [comments, setComments] = useState([])
   const [users, setUsers] = useState([])
@@ -41,14 +55,13 @@ export function useDocumentSync(docId, user) {
   }
 
   useEffect(() => {
-    console.debug('[dbg] EFFECT RUN', Date.now(), docId, user?.name, user?.color)
     let cancelled = false
     let provider = null
     let ydoc = null
 
     const buildFallbackPayload = (target) => {
-      if (!target || wsConnectedRef.current) return null
-      const blocks = snapshotFromYArray(target.getArray('blocks')).map((b) => ({
+      if (!target) return null
+      const blocks = dedupeBlocks(snapshotFromYArray(target.getArray('blocks')).map((b) => ({
         id: b.id,
         type: b.type,
         text: b.text || '',
@@ -59,9 +72,10 @@ export function useDocumentSync(docId, user) {
         attrs: { marks: Array.isArray(b.marks) ? b.marks : [] },
         parentId: b.parentId || null,
         order: b.order
-      }))
+      })))
       return {
         title: String(target.getMap('meta').get('title') ?? 'Untitled'),
+        wallpaper: String(target.getMap('meta').get('wallpaper') ?? 'none'),
         blocks,
         comments: commentsFromYArray(target.getArray('comments'))
       }
@@ -105,7 +119,7 @@ export function useDocumentSync(docId, user) {
         const blocksArr = ydoc.getArray('blocks')
         const commentsArr = ydoc.getArray('comments')
         const applyBlocks = () => {
-          const full = snapshotFromYArray(blocksArr)
+          const full = dedupeBlocks(snapshotFromYArray(blocksArr))
           setBlocks((prev) => {
             const delta = diffBlocks(prev, full)
             return delta.length ? mergeDelta(prev, delta) : prev
@@ -121,6 +135,8 @@ export function useDocumentSync(docId, user) {
         const applyTitle = () => {
           const metaTitle = ydoc.getMap('meta').get('title')
           setTitle(metaTitle == null ? 'Untitled' : String(metaTitle))
+          const metaWallpaper = ydoc.getMap('meta').get('wallpaper')
+          setWallpaperState(metaWallpaper == null ? 'none' : String(metaWallpaper))
           setSavedAt(Date.now())
           scheduleFallbackSave()
         }
@@ -137,14 +153,13 @@ export function useDocumentSync(docId, user) {
         }
 
         const scheduleFallbackSave = () => {
-          if (wsConnectedRef.current) return
           clearTimeout(fallbackSaveTimerRef.current)
           fallbackSaveTimerRef.current = setTimeout(() => {
             if (cancelled) return
             const payload = buildFallbackPayload(ydoc)
             if (!payload) return
             saveDocumentContent(docId, payload).catch(() => { /* retried on next edit */ })
-          }, 1500)
+          }, 800)
         }
 
         document.addEventListener('visibilitychange', onVisibility)
@@ -172,7 +187,6 @@ export function useDocumentSync(docId, user) {
     init()
 
     return () => {
-      console.debug('[dbg] EFFECT CLEANUP', Date.now(), docId, 'hadYdoc', !!ydoc)
       cancelled = true
       clearTimeout(renameTimerRef.current)
       clearTimeout(typingTimerRef.current)
@@ -194,7 +208,6 @@ export function useDocumentSync(docId, user) {
 
   function updateBlockText(id, text) {
     const ydoc = ydocRef.current
-    console.debug('[dbg] updateBlockText', Date.now(), id.slice(0, 6), JSON.stringify(text).slice(0, 20), 'ydoc?', !!ydoc)
     if (!ydoc) return
     ydoc.transact(() => {
       ydoc.getArray('blocks').forEach((m) => {
@@ -437,6 +450,13 @@ export function useDocumentSync(docId, user) {
     }, 400)
   }
 
+  function setWallpaper(id) {
+    const ydoc = ydocRef.current
+    if (!ydoc) return
+    const next = String(id || 'none')
+    ydoc.getMap('meta').set('wallpaper', next)
+  }
+
   function refreshOrder(arr) {
     arr.toArray().forEach((m, i) => m.set('order', i))
   }
@@ -452,5 +472,5 @@ export function useDocumentSync(docId, user) {
       }
     }
 
-  return { status, title, blocks, comments, users, myClientId, docRole, savedAt, updateBlockText, addBlock, changeBlockType, toggleBlockChecked, toggleBlockOpen, toggleBlockCollapsed, toggleBlockMark, clearBlockMarks, setCursor, setTyping, notifyTyping, updateTitle, deleteBlock, moveBlock, reorderBlock, addComment, resolveComment, deleteComment }
+  return { status, title, wallpaper, setWallpaper, blocks, comments, users, myClientId, docRole, savedAt, updateBlockText, addBlock, changeBlockType, toggleBlockChecked, toggleBlockOpen, toggleBlockCollapsed, toggleBlockMark, clearBlockMarks, setCursor, setTyping, notifyTyping, updateTitle, deleteBlock, moveBlock, reorderBlock, addComment, resolveComment, deleteComment }
 }

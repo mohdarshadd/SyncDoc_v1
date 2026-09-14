@@ -14,12 +14,9 @@ const ACCESS_SECRET = process.env.JWT_ACCESS_SECRET || 'syncdoc-access-secret-de
 
 const Document = require('../models/Document')
 const Share = require('../models/Share')
-const { astToYdoc, ydocToAst } = require('./astAdapter')
-const { sanitizeBlocks, sanitizeComments } = require('../security/sanitize')
+const { astToYdoc } = require('./astAdapter')
 
-const PERSIST_DEBOUNCE_MS = 400
 const rooms = new Map()
-const persistTimers = new Map()
 
 function roomFor(docId) {
   let room = rooms.get(docId)
@@ -56,9 +53,7 @@ async function loadRoom(room, docId, userId) {
       loaded.destroy()
 
       room.ydoc.on('update', (update, origin) => {
-        console.log(`[dbg-ws] ydoc update docId=${docId} origin=${origin?.constructor?.name || origin} blocks=${room.ydoc.getArray('blocks').length}`)
         broadcastUpdate(room, update, origin)
-        schedulePersist(docId, room.ydoc)
       })
 
       room.awareness = new awarenessProtocol.Awareness(room.ydoc)
@@ -80,35 +75,6 @@ function broadcastUpdate(room, update, origin) {
   }
 }
 
-function schedulePersist(docId, ydoc) {
-  clearTimeout(persistTimers.get(docId))
-  persistTimers.set(
-    docId,
-    setTimeout(() => persistRoom(docId, ydoc), PERSIST_DEBOUNCE_MS)
-  )
-}
-
-async function persistRoom(docId, ydoc) {
-  try {
-    const ast = ydocToAst(ydoc)
-    ast.nodes = sanitizeBlocks(ast.nodes)
-    ast.comments = sanitizeComments(ast.comments)
-    console.log(`[dbg-ws] persisting docId=${docId} blocks=${ast.nodes?.length} revision=${ydoc.meta?.get?.('revision')}`)
-    let doc = null
-    if (mongoose.Types.ObjectId.isValid(docId)) {
-      doc = await Document.findById(docId)
-    }
-    if (!doc) return
-    if (ast.title != null) doc.title = ast.title
-    doc.nodes = ast.nodes
-    doc.comments = ast.comments
-    await doc.save()
-    console.log(`[dbg-ws] persisted OK docId=${docId} rev=${doc.revision}`)
-  } catch (e) {
-    console.error(`[sync] persist failed ${docId}: ${e.message}`)
-  }
-}
-
 function sendAwarenessTo(ws, awareness, keys) {
   const encoder = encoding.createEncoder()
   encoding.writeVarUint(encoder, MESSAGE_AWARENESS)
@@ -119,7 +85,6 @@ function sendAwarenessTo(ws, awareness, keys) {
 function handleConnection(ws, req) {
   const url = new URL(req.url, 'http://localhost')
   const docId = decodeURIComponent(url.pathname.replace(/^\/ws\/?/, ''))
-  console.log(`[dbg-ws] connection attempt docId=${docId}`)
   if (!docId) {
     ws.close(4000, 'missing document id')
     return
@@ -145,42 +110,16 @@ function handleConnection(ws, req) {
   let loaded = false
 
 const handleMessage = (ws, data) => {
-      const decoder = decoding.createDecoder(new Uint8Array(data))
-      const messageType = decoding.readVarUint(decoder)
-      let innerType = 'n/a'
-      let updateLen = 0
-      if (messageType === MESSAGE_SYNC) {
-        try {
-          const peekDec = decoding.createDecoder(new Uint8Array(data))
-          decoding.readVarUint(peekDec)
-          innerType = decoding.readVarUint(peekDec)
-          const after = new Uint8Array(data)
-          if (after.length > 2) updateLen = after.length
-        } catch (e) { innerType = 'peek-err' }
-      }
-      console.log(`[dbg-ws] msg type=${messageType} inner=${innerType} len=${new Uint8Array(data).length} docId=${docId}`)
-      const encoder = encoding.createEncoder()
+    const decoder = decoding.createDecoder(new Uint8Array(data))
+    const messageType = decoding.readVarUint(decoder)
+    const encoder = encoding.createEncoder()
     switch (messageType) {
       case MESSAGE_SYNC:
         encoding.writeVarUint(encoder, MESSAGE_SYNC)
-        {
-          try {
-            const innerMsgType = decoding.peekVarUint(decoder)
-            const beforeSV = Array.from(Y.encodeStateVector(room.ydoc))
-            syncProtocol.readSyncMessage(decoder, encoder, room.ydoc, ws)
-            const afterSV = Array.from(Y.encodeStateVector(room.ydoc))
-            const svEqual = JSON.stringify(beforeSV) === JSON.stringify(afterSV)
-            if (innerMsgType === 2) {
-              const testUpdate = Y.encodeStateAsUpdate(room.ydoc)
-              const testDoc = new Y.Doc()
-              Y.applyUpdate(testDoc, testUpdate)
-              const testArr = testDoc.getArray('blocks').length
-              console.log(`[dbg-ws] UPDATE inner=2 docId=${docId} svSame=${svEqual} ydocClientId=${room.ydoc.clientID} testDocBlocks=${testArr}`)
-              testDoc.destroy()
-            }
-          } catch (e) {
-            console.error(`[dbg-ws] readSyncMessage ERROR docId=${docId}: ${e.message}`)
-          }
+        try {
+          syncProtocol.readSyncMessage(decoder, encoder, room.ydoc, ws)
+        } catch (e) {
+          console.error(`[sync] readSyncMessage error ${docId}: ${e.message}`)
         }
         if (encoding.length(encoder) > 1) ws.send(encoding.toUint8Array(encoder))
         break
@@ -207,7 +146,6 @@ const handleMessage = (ws, data) => {
     .then(() => {
       loaded = true
       room.conns.add(ws)
-      console.log(`[dbg-ws] room loaded docId=${docId} conns=${room.conns.size} ydocBlocks=${room.ydoc.getArray('blocks').length}`)
       const { awareness } = room
 
       const clients = Array.from(awareness.getStates().keys())
